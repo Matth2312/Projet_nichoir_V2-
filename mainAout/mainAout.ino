@@ -1,36 +1,33 @@
 #include <Arduino.h>
+#include <cstdint>
+#include "M5TimerCAM.h"
+#include "MyTimerCam.h"
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <WebServer.h>
-#include <Preferences.h>
 #include <DNSServer.h>
-#include "MyTimerCam.h"
-#include <driver/adc.h>
-#include "esp_sleep.h"
-#include "esp_bt.h"     // btStop()
+#include <Preferences.h>
+#include "driver/rtc_io.h"
 #include "driver/gpio.h"
-
+#include "esp_sleep.h"
+#include "esp_bt.h"          // btStop()
 
 // ================= CONFIGURATION =================
 
 // MQTT
-const char* MQTT_SERVER   = "192.168.2.4";
-const uint16_t MQTT_PORT  = 1883;
-const char* TOPIC_IMAGE   = "nichoir/image";
-const char* TOPIC_BAT     = "nichoir/batterie";
+const char* MQTT_SERVER = "192.168.2.4";
+const uint16_t MQTT_PORT = 1883;
+const char* TOPIC_IMAGE = "nichoir/image";
+const char* TOPIC_BAT   = "nichoir/batterie";
 
-// Point d'Accès
-const char* AP_SSID       = "NichoirConfigTHERER";
-const char* AP_PASSWORD   = "12345678";
+// Point d'Acces (config WiFi initiale)
+const char* AP_SSID     = "NichoirConfigTHERER";
+const char* AP_PASSWORD = "12345678";
 
-// --- SLEEP + PIR ---
-#define PIR_PIN 4                  // <-- GPIO RTC recommandé pour EXT0
-#define COOLDOWN_TIME_SEC 60      // 5 minutes (à adapter)
-
-// Pins
-#define BAT_ADC_PIN   38
-#define BAT_HOLD_PIN  33
-#define LED_PIN 2
+#define PIR_WAKEUP_PIN GPIO_NUM_4
+#define HEARTBEAT_SEC (24UL * 60UL * 60UL) 
+#define BM8563_COOLDOWN_SEC (6UL * 60UL)     // 6 minutes
+#define POWER_HOLD_PIN GPIO_NUM_33
 
 // ================= OBJETS GLOBAUX =================
 
@@ -44,11 +41,11 @@ DNSServer dnsServer;
 String wifiSsid;
 String wifiPass;
 bool isStationMode = false;
-unsigned long lastCapture = 0; // (plus vraiment utilisé en station sleep)
 bool shouldRestart = false;
 unsigned long restartStart = 0;
 
-// ================= HTML DYNAMIQUE =================
+// ================= HTML CONFIG WIFI =================
+
 String getPageHTML() {
   String html = R"rawliteral(<!DOCTYPE html>
   <html><head><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -88,94 +85,12 @@ String getPageHTML() {
   return html;
 }
 
-// ================= FONCTIONS BATTERIE =================
-
-float readBatteryVoltage() {
-  digitalWrite(BAT_HOLD_PIN, HIGH);
-  delay(10);
-
-  adc1_config_width(ADC_WIDTH_BIT_12);
-  adc1_config_channel_atten(ADC1_CHANNEL_2, ADC_ATTEN_DB_11);
-
-  long sum = 0;
-  for(int i=0; i<20; i++) {
-    sum += adc1_get_raw(ADC1_CHANNEL_2);
-    delay(5);
-  }
-  float raw = sum / 20.0;
-  Serial.printf("[DEBUG] Raw Low-Level: %.2f\n", raw);
-
-  if (raw < 1) return 0.0;
-
-  // Ton calcul (je ne change pas)
-  float voltage = ((raw / 4095.0) * 3.3 * 2.0) - 1;
-  return voltage;
-}
-
-void sendBattery() {
-  float voltage = readBatteryVoltage();
-  String msg = String(voltage, 2);
-  Serial.print("Tension Batterie: "); Serial.print(msg); Serial.println(" V");
-  mqttClient.publish(TOPIC_BAT, msg.c_str());
-}
-
-// ================= FONCTIONS CAMERA / MQTT =================
-
-void sendImage(camera_fb_t* fb) {
-  if (!fb || fb->len == 0) return;
-
-  if (mqttClient.getBufferSize() < fb->len + 500) {
-    mqttClient.setBufferSize(fb->len + 500);
-  }
-
-  Serial.printf("Envoi Image MQTT (%u bytes)... ", (unsigned)fb->len);
-  bool ok = mqttClient.publish(TOPIC_IMAGE, (const uint8_t*)fb->buf, fb->len, false);
-  Serial.println(ok ? "OK" : "ECHEC");
-}
-
-void reconnectMQTT() {
-  if (!mqttClient.connected()) {
-    Serial.print("Connexion MQTT...");
-    String clientId = "TimerCAM-" + String((uint32_t)ESP.getEfuseMac(), HEX);
-    if (mqttClient.connect(clientId.c_str())) {
-      Serial.println("OK");
-    } else {
-      Serial.print("Echec rc="); Serial.println(mqttClient.state());
-    }
-  }
-}
-
-bool connectMQTT() {
-  mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
-  reconnectMQTT();
-  return mqttClient.connected();
-}
-
-// ================= WIFI & AP LOGIC =================
-
-bool connectToSavedWiFi() {
-  if (wifiSsid == "") return false;
-
-  Serial.println("Tentative de connexion STA...");
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
-
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && (millis() - start) < 10000) {
-    delay(500); Serial.print(".");
-  }
-  Serial.println();
-
-  return (WiFi.status() == WL_CONNECTED);
-}
-
 void startConfigAP() {
   Serial.println(">>> MODE AP CONFIGURATION <<<");
-  digitalWrite(LED_PIN, HIGH);
+  TimerCAM.Power.setLed(255);
   WiFi.disconnect();
   delay(100);
   WiFi.mode(WIFI_AP);
-
   WiFi.softAP(AP_SSID, AP_PASSWORD);
   Serial.print("IP AP: "); Serial.println(WiFi.softAPIP());
 
@@ -199,10 +114,8 @@ void startConfigAP() {
       preferences.end();
 
       String resp = "<html><body style='font-family:sans-serif;text-align:center;margin-top:50px;'>";
-      resp += "<h1>Sauvegarde OK</h1>";
-      resp += "<p>Redemarrage dans 10s...</p>";
+      resp += "<h1>Sauvegarde OK</h1><p>Redemarrage dans 10s...</p>";
       resp += "<a href='/' style='color:red;'>ANNULER</a></body></html>";
-
       server.send(200, "text/html", resp);
 
       shouldRestart = true;
@@ -219,81 +132,81 @@ void startConfigAP() {
   server.begin();
 }
 
-// ================= SLEEP LOGIC (PIR -> LIGHT SLEEP -> ACTION -> DEEP SLEEP) =================
+// ================= WIFI (station) =================
 
-void runDetectionCycle() {
-  // ------------------------------------------------------
-  // ETAPE 1 : ATTENTE PIR (méthode fonctionnelle: digitalRead)
-  // ------------------------------------------------------
-  Serial.println("\n=== [ETAPE 1] ATTENTE PIR (digitalRead) ===");
-
-  pinMode(PIR_PIN, INPUT);           // <-- comme ton exemple (pas de pulldown)
-  digitalWrite(LED_PIN, LOW);
-  digitalWrite(BAT_HOLD_PIN, LOW);
-
-  // (optionnel) couper WiFi/BT pendant l'attente pour économiser
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_OFF);
-  btStop();
-
-  // On attend un HIGH stable
-  while (true) {
-    int state = digitalRead(PIR_PIN);
-
-    if (state == HIGH) {
-      Serial.println("Signal détecté !");
-      digitalWrite(LED_PIN, HIGH);
-      break;
-    } else {
-      Serial.println("Pas de signal");
-      digitalWrite(LED_PIN, LOW);
-    }
-
-    delay(500); // évite le spam + laisse respirer
-  }
-
-  // ------------------------------------------------------
-  // ETAPE 2 : REVEIL (mouvement) -> WiFi -> Camera -> MQTT
-  // ------------------------------------------------------
-Serial.println("\n=== [ETAPE 2] EVENT PIR (digitalRead) ===");
-Serial.println("[EVENT] Mouvement detecte (PIR)!");
-
-
-  // Recharge creds
-  preferences.begin("wifi", true);
-  wifiSsid = preferences.getString("ssid", ""); 
-  wifiPass = preferences.getString("password", "");
-  preferences.end();
-
-  if (wifiSsid == "") {
-    Serial.println("[WIFI] Pas de SSID sauvegarde -> Mode AP");
-    startConfigAP();
-    isStationMode = false;
-    return;
-  }
+bool connectWiFiSTA() {
+  if (wifiSsid == "") return false;
 
   Serial.printf("[WIFI] Connexion a '%s'...\n", wifiSsid.c_str());
   WiFi.mode(WIFI_STA);
   WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
 
-  unsigned long startW = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startW < 10000) {
-    delay(100); Serial.print(".");
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - start) < 10000) {
+    delay(200);
+    Serial.print(".");
   }
   Serial.println();
 
   if (WiFi.status() == WL_CONNECTED) {
     Serial.print("[WIFI] Connecte ! IP: "); Serial.println(WiFi.localIP());
-    digitalWrite(LED_PIN, HIGH);
+    return true;
+  }
+  Serial.println("[WIFI] Echec connexion (timeout).");
+  return false;
+}
 
+// ================= MQTT =================
+
+bool connectMQTT() {
+  mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
+  if (!mqttClient.connected()) {
+    Serial.print("[MQTT] Connexion...");
+    String clientId = "TimerCAM-" + String((uint32_t)ESP.getEfuseMac(), HEX);
+    if (mqttClient.connect(clientId.c_str())) {
+      Serial.println("OK");
+    } else {
+      Serial.print("Echec rc="); Serial.println(mqttClient.state());
+    }
+  }
+  return mqttClient.connected();
+}
+
+void sendBattery() {
+  int voltage_mV = TimerCAM.Power.getBatteryVoltage();
+  int level_pct  = TimerCAM.Power.getBatteryLevel();
+
+  String msg = String(voltage_mV / 1000.0, 2); // en Volts, comme avant
+  Serial.printf("[BAT] %d mV (%d %%)\n", voltage_mV, level_pct);
+  mqttClient.publish(TOPIC_BAT, msg.c_str());
+}
+
+void sendImage(camera_fb_t* fb) {
+  if (!fb || fb->len == 0) return;
+
+  if (mqttClient.getBufferSize() < fb->len + 500) {
+    mqttClient.setBufferSize(fb->len + 500);
+  }
+
+  Serial.printf("[MQTT] Envoi Image (%u bytes)... ", (unsigned)fb->len);
+  bool ok = mqttClient.publish(TOPIC_IMAGE, (const uint8_t*)fb->buf, fb->len, false);
+  Serial.println(ok ? "OK" : "ECHEC");
+}
+
+// ================= LES DEUX EVENEMENTS POSSIBLES EN SENTINELLE =================
+
+// Reveil PIR (EXT0) : photo + batterie, puis cooldown BM8563 (6 min)
+void handlePIRDetection() {
+  Serial.println("\n=== [EVENT] Mouvement detecte sur le PIR ===");
+  TimerCAM.Power.setLed(255);
+
+  if (connectWiFiSTA()) {
     Serial.print("[CAM] Initialisation camera...");
     bool camOK = Camera.begin(FRAMESIZE_SVGA, PIXFORMAT_JPEG, 1, 12);
     Serial.println(camOK ? "OK" : "ERREUR");
 
     if (camOK) {
-      Serial.println("[CAM] Prise de photo...");
       camera_fb_t* fb = Camera.capture();
-
       if (fb) {
         if (connectMQTT()) {
           mqttClient.loop();
@@ -308,80 +221,130 @@ Serial.println("[EVENT] Mouvement detecte (PIR)!");
         Serial.println("[CAM] Erreur: Framebuffer vide !");
       }
     }
-    delay(200);
-  } else {
-    Serial.println("[WIFI] Echec connexion (timeout).");
   }
 
-  // ------------------------------------------------------
-  // ETAPE 3 : DEEP SLEEP (Cooldown)
-  // ------------------------------------------------------
-  Serial.println("\n=== [ETAPE 3] PREPARATION DEEP SLEEP ===");
-  Serial.printf("[TIMER] Cooldown %d secondes\n", COOLDOWN_TIME_SEC);
-
-  digitalWrite(BAT_HOLD_PIN, LOW);
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
   btStop();
+  TimerCAM.Power.setLed(0);
+}
 
-  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
-  esp_sleep_enable_timer_wakeup((uint64_t)COOLDOWN_TIME_SEC * 1000000ULL);
+void handleHeartbeat() {
+  Serial.println("\n=== [EVENT] Heartbeat 24h ===");
+  TimerCAM.Power.setLed(255);
 
-  Serial.println("[SLEEP] Deep sleep...");
+  if (connectWiFiSTA()) {
+    if (connectMQTT()) {
+      mqttClient.loop();
+      sendBattery();
+      mqttClient.loop();
+    } else {
+      Serial.println("[MQTT] Connexion impossible, abandon envoi.");
+    }
+  }
+
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  btStop();
+  TimerCAM.Power.setLed(0);
+}
+
+void goToSentinelSleep() {
+  TimerCAM.Power.setLed(0);
+
+  gpio_hold_en(POWER_HOLD_PIN);
+  gpio_deep_sleep_hold_en();
+
+  rtc_gpio_pulldown_en(PIR_WAKEUP_PIN);
+  rtc_gpio_pullup_dis(PIR_WAKEUP_PIN);
+  esp_sleep_enable_ext0_wakeup(PIR_WAKEUP_PIN, 1);
+  esp_sleep_enable_timer_wakeup((uint64_t)HEARTBEAT_SEC * 1000000ULL);
+
+  Serial.println("[SLEEP] Sentinelle : Deep Sleep natif (PIR + 24h)");
   Serial.flush();
   esp_deep_sleep_start();
+  
+}
+
+void goToBM8563Cooldown() {
+  Serial.println("[SLEEP] Cooldown BM8563 (6 min) apres detection");
+
+  
+  preferences.begin("nichoir", false);
+  preferences.putBool("bm8563_ret", true);
+  preferences.end();
+
+  TimerCAM.Power.setLed(0);
+  TimerCAM.Rtc.disableIRQ();
+  TimerCAM.Rtc.setAlarmIRQ(BM8563_COOLDOWN_SEC);
+
+  Serial.flush();
+  TimerCAM.Power.powerOff();
 }
 
 // ================= SETUP =================
 
 void setup() {
   Serial.begin(115200);
-  delay(1000);
+  delay(200);
 
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
+  gpio_hold_dis(POWER_HOLD_PIN);
+  gpio_deep_sleep_hold_dis();
 
-  // --- Préparer le deep sleep / maintien alim sur batterie (M5TimerCAM) ---
-  pinMode(BAT_HOLD_PIN, OUTPUT);
-  digitalWrite(BAT_HOLD_PIN, HIGH);                 // garde l'alim active
-  gpio_hold_en((gpio_num_t)BAT_HOLD_PIN);
-  gpio_deep_sleep_hold_en();
+  TimerCAM.begin(true);     // I2C pour le BM8563 (RTC)
+  TimerCAM.Power.begin();   // maintien alim (GPIO33) + ADC batterie + LED (GPIO2)
 
-  
+  // --- Cas 1 : on revient d'un cooldown BM8563 (apres une detection) ---
+  preferences.begin("nichoir", false);
+  bool returningFromCooldown = preferences.getBool("bm8563_ret", false);
+  if (returningFromCooldown) {
+    preferences.putBool("bm8563_ret", false);
+    preferences.end();
+    Serial.println("[BOOT] Retour du cooldown BM8563 -> reprise en sentinelle");
+    goToSentinelSleep();
+    return;
+  }
+  preferences.end();
 
-  // Lire SSID/PASS
+  // --- Chargement des identifiants WiFi ---
   preferences.begin("wifi", true);
   wifiSsid = preferences.getString("ssid", "");
   wifiPass = preferences.getString("password", "");
   preferences.end();
 
-  // Si on a déjà un WiFi : station mode.
-  // Sinon : AP config (comme avant)
-  if (connectToSavedWiFi()) {
-    isStationMode = true;
-    Serial.println("Connecte au WiFi !");
-    Serial.print("IP: "); Serial.println(WiFi.localIP());
-    mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
-  } else {
+  if (wifiSsid == "") {
+  
+    Serial.println("[WIFI] Pas de SSID sauvegarde -> Mode AP");
     isStationMode = false;
     startConfigAP();
+    return;
+  }
+  isStationMode = true;
+
+  // --- Cas 2 : identification de la cause du reveil (mode sentinelle) ---
+  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+
+  if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0) {
+    handlePIRDetection();
+    goToBM8563Cooldown();
+    return; // jamais atteint
+  }
+  else if (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER) {
+    handleHeartbeat();
+    goToSentinelSleep();
+    return; // jamais atteint
+  }
+  else {
+    Serial.println("[BOOT] Premier demarrage");
+    goToSentinelSleep();
+    return;
   }
 }
 
 // ================= LOOP =================
 
 void loop() {
- digitalWrite(LED_PIN, HIGH);
-
-  if (isStationMode) {
-    // Nouveau comportement: on attend PIR en light sleep,
-    // puis on fait photo+MQTT et on part en deep sleep.
-    runDetectionCycle();
-
-    // Si jamais on revient ici (réveil inattendu), petite pause
-    delay(50);
-  } else {
-    // Mode AP inchangé
+  if (!isStationMode) {
     dnsServer.processNextRequest();
     server.handleClient();
 
@@ -391,15 +354,3 @@ void loop() {
     }
   }
 }
-
-
- 
-
-
-     // --- DEBUT BLOC EFFACEMENT ---
-  // Serial.println("!!! EFFACEMENT DU WIFI !!!");
-  // preferences.begin("wifi", false); // On ouvre l'espace mémoire "wifi"
-  // preferences.clear();              // On efface tout ce qu'il y a dedans
-  // preferences.end();
-  // Serial.println("Mémoire effacée. Redémarrage en mode AP au prochain boot.");
-  // --- FIN BLOC EFFACEMENT ---
