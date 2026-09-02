@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Galerie du Nichoir</title>
+    <style>
+        body { font-family: sans-serif; background-color: #f4f4f4; margin: 0; padding: 20px; }
+        h1 { text-align: center; color: #333; }
+        
+        /* Grille des photos */
+        .gallery {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 20px;
+            padding: 20px;
+        }
+
+        /* Carte pour chaque photo */
+        .photo-card {
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            overflow: hidden;
+            transition: transform 0.2s;
+        }
+        .photo-card:hover { transform: translateY(-5px); }
+
+        /* L'image elle-même */
+        .photo-card img {
+            width: 100%;
+            height: 250px;
+            object-fit: cover;
+            cursor: pointer; /* Indique qu'on peut cliquer */
+            transition: opacity 0.3s;
+        }
+        .photo-card img:hover {
+            opacity: 0.8;
+        }
+
+        /* Les infos (date, batterie) */
+        .info { padding: 15px; }
+        .date { font-weight: bold; color: #555; }
+        .details { color: #777; font-size: 0.9em; margin-top: 5px; }
+        .badge { 
+            display: inline-block; 
+            padding: 3px 8px; 
+            border-radius: 12px; 
+            background-color: #e0e0e0; 
+            font-size: 0.8em;
+        }
+
+        /* --- NOUVEAU : STYLE POUR LA MODAL (IMAGE AGRANDIE) --- */
+        .modal {
+            display: none; /* Caché par défaut */
+            position: fixed; 
+            z-index: 1000; /* Au-dessus de tout */
+            padding-top: 50px; 
+            left: 0;
+            top: 0;
+            width: 100%; 
+            height: 100%; 
+            overflow: auto; 
+            background-color: rgba(0,0,0,0.9); /* Fond noir semi-transparent */
+        }
+
+        .modal-content {
+            margin: auto;
+            display: block;
+            width: 80%;
+            max-width: 900px;
+            max-height: 80vh; /* Max 80% de la hauteur de l'écran */
+            object-fit: contain;
+            border-radius: 5px;
+            animation-name: zoom;
+            animation-duration: 0.3s;
+        }
+
+        @keyframes zoom {
+            from {transform:scale(0)} 
+            to {transform:scale(1)}
+        }
+
+        .close {
+            position: absolute;
+            top: 15px;
+            right: 35px;
+            color: #f1f1f1;
+            font-size: 40px;
+            font-weight: bold;
+            transition: 0.3s;
+            cursor: pointer;
+        }
+
+        .close:hover,
+        .close:focus {
+            color: #bbb;
+            text-decoration: none;
+            cursor: pointer;
+        }
+
+        /* Ajustement mobile pour la modal */
+        @media only screen and (max-width: 700px){
+            .modal-content {
+                width: 100%;
+            }
+        }
+    </style>
+</head>
+<body>
+
+    <h1>🐦 Galerie du Nichoir</h1>
+
+    <div class="gallery">
+        {% for photo in photos %}
+        <div class="photo-card">
+            <img src="{{ url_for('get_image', image_id=photo.id) }}" alt="Photo du nichoir" class="clickable-img">
+            
+            <div class="info">
+                <div class="date">{{ photo.date_capture }}</div>
+                <div class="details">
+                    {% if photo.niveau_batterie %}
+                        <span class="badge">🔋 {{ photo.niveau_batterie }}V</span>
+                    {% else %}
+                        <span class="badge">🔋 N/A</span>
+                    {% endif %}
+                    
+                    {% if photo.commentaire %}
+                        <p>📝 {{ photo.commentaire }}</p>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+
+    <div id="myModal" class="modal">
+        <span class="close">&times;</span>
+        <img class="modal-content" id="img01">
+    </div>
+
+    <script>
+        // Récupérer la modal
+        var modal = document.getElementById("myModal");
+
+        // Récupérer l'image dans la modal et le caption
+        var modalImg = document.getElementById("img01");
+
+        // Récupérer toutes les images de la galerie
+        var images = document.getElementsByClassName("clickable-img");
+
+        // Ajouter l'événement de clic sur chaque image
+        for (var i = 0; i < images.length; i++) {
+            images[i].onclick = function(){
+                modal.style.display = "block";
+                modalImg.src = this.src; // On reprend la source de l'image cliquée
+            }
+        }
+
+        // Récupérer l'élément <span> qui ferme la modal
+        var span = document.getElementsByClassName("close")[0];
+
+        // Quand on clique sur (x), on ferme
+        span.onclick = function() { 
+            modal.style.display = "none";
+        }
+
+        // Fermer aussi si on clique en dehors de l'image (sur le fond noir)
+        modal.onclick = function(event) {
+            if (event.target === modal) {
+                modal.style.display = "none";
+            }
+        }
+    </script>
+
+</body>
+</html>
