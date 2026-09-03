@@ -4,7 +4,7 @@ import os
 
 app = Flask(__name__)
 
-# Configuration de la base de données
+# Configuration de la base de donnees
 db_config = {
     "user": "mat",
     "password": "123456789",

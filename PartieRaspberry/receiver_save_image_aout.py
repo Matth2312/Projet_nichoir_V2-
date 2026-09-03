@@ -6,18 +6,17 @@ import mariadb
 from datetime import datetime
 import paho.mqtt.client as mqtt
 
-# -----------------------------
-# CONFIG MQTT
-# -----------------------------
-BROKER_IP   = "192.168.1.15"
+# ----------------------------- CONFIG MQTT -----------------------------
+BROKER_IP   = "192.168.1.15" #je dois modif ca
 BROKER_PORT = 1883
+
 TOPIC_IMAGE = "nichoir/image"
-TOPIC_BAT   = "nichoir/batterie"  # <--- NOUVEAU
+TOPIC_BAT   = "nichoir/batterie"
 
 # -----------------------------
 # VARIABLE GLOBALE
 # -----------------------------
-# On stocke ici la dernière valeur de batterie reçue
+# On stocke ici la dernière valeur de batterie recue
 derniere_batterie = None 
 
 # -----------------------------
